@@ -507,7 +507,7 @@ ad_transport_peer_t* ad_transport_peer_table_lookup(const struct sockaddr_in *ad
         int r = peer_match_lpm(peer, ip, &matched, &preflen);
         if (r == 1) {
             if ((int)preflen > best_prefix) { best_prefix = preflen; best_peer = peer; conflict = 0; }
-            else if (preflen == (uint8_t)best_prefix) conflict = 1;
+            else if ((int)preflen == best_prefix) conflict = 1;
         } else if (r == -1) {
             conflict = 1;
         }
