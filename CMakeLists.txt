@@ -27,11 +27,13 @@ add_library(ad_transport SHARED ${AD_TRANSPORT_SOURCES})
 target_include_directories(ad_transport PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/../../prebuilt/inih/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/../ad_logger/include)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../ad_logger/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../ad_tun/include)
 
 # ---- LINK LIBRARIES ----
 target_link_libraries(ad_transport
     ${CMAKE_CURRENT_SOURCE_DIR}/../ad_logger/build/lib/libad_logger.so
+    ${CMAKE_CURRENT_SOURCE_DIR}/../ad_tun/build/lib/libad_tun.so
     sqlite3
 )
 

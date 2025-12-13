@@ -6,6 +6,7 @@
 **************************************************/
 
 #include "../include/ad_transport.h"
+#include "../../ad_tun/include/ad_tun.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -14,6 +15,11 @@
 #include <arpa/inet.h>
 #include <unistd.h>     /* sleep */
 #include <ctype.h>      /* isspace */
+#include <fcntl.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <time.h>
+#include <sqlite3.h>
 
 /* ============================
  * Logging Macros are expected
@@ -25,8 +31,10 @@
 #define DEFAULT_INITIAL_CAPACITY 16
 #define DEFAULT_PERSIST_INTERVAL_SEC 120
 
-/* Global definitions (previously were static in header) */
+/* Global definitions */
 ad_transport_peer_table_t *g_ad_global_peer_table = NULL;
+/* Global transport config (single definition) */
+ad_transport_config_t g_transport_config = {0};
 sqlite3 *g_db = NULL;
 pthread_t g_persist_thread = 0;
 volatile int g_run_persist = 0;
@@ -87,8 +95,8 @@ static int peer_match_lpm(const ad_transport_peer_t *peer, uint32_t ip,
     if (!peer || peer->route_count == 0) return 0;
 
     int best_prefix = -1;
-    int best_count = 0;
     const struct sockaddr_in *best_route = NULL;
+    int match_count = 0;  // track number of equally best matches
 
     for (size_t i = 0; i < peer->route_count; i++) {
         uint32_t net = peer->routes[i].sin_addr.s_addr;
@@ -98,15 +106,15 @@ static int peer_match_lpm(const ad_transport_peer_t *peer, uint32_t ip,
             if ((int)prefix > best_prefix) {
                 best_prefix = prefix;
                 best_route = &peer->routes[i];
-                best_count = 1;
+                match_count = 1;
             } else if ((int)prefix == best_prefix) {
-                best_count++;
+                match_count++;
             }
         }
     }
 
-    if (best_prefix < 0) return 0;         /* no match */
-    if (best_count > 1) return -1;         /* conflict */
+    if (best_prefix < 0) return 0;      // no match
+    if (match_count > 1) return -1;      // conflict within this peer
     if (best_route_out) *best_route_out = best_route;
     if (best_prefix_out) *best_prefix_out = (uint8_t)best_prefix;
     return 1;
@@ -484,7 +492,13 @@ ad_peer_table_error_t ad_transport_peer_table_remove(const char *peer_id)
     return AD_PEER_TABLE_ERR_NOT_FOUND;
 }
 
-/* Lookup by IPv4 address LPM */
+/* Lookup by IPv4 address using Longest Prefix Match.
+ * Returned pointer is internal; caller must NOT free.
+ * On error, NULL is returned and errno is set:
+ *  ENOENT - no match
+ *  EEXIST - multiple matches (conflict)
+ *  EINVAL - invalid argument
+ */
 ad_transport_peer_t* ad_transport_peer_table_lookup(const struct sockaddr_in *addr)
 {
     if (!addr || !g_ad_global_peer_table) {
@@ -502,21 +516,27 @@ ad_transport_peer_t* ad_transport_peer_table_lookup(const struct sockaddr_in *ad
     for (size_t i = 0; i < g_ad_global_peer_table->count; i++) {
         ad_transport_peer_t *peer = &g_ad_global_peer_table->entries[i];
         if (!peer->peer_id || !peer->routes) continue;
-        const struct sockaddr_in *matched = NULL;
+
+        const struct sockaddr_in *route = NULL;
         uint8_t preflen = 0;
-        int r = peer_match_lpm(peer, ip, &matched, &preflen);
+        int r = peer_match_lpm(peer, ip, &route, &preflen);
+
         if (r == 1) {
-            if ((int)preflen > best_prefix) { best_prefix = preflen; best_peer = peer; conflict = 0; }
-            else if ((int)preflen == best_prefix) conflict = 1;
+            if ((int)preflen > best_prefix) {
+                best_prefix = preflen;
+                best_peer = peer;
+                conflict = 0;  // reset conflict
+            } else if ((int)preflen == best_prefix) {
+                conflict = 1;  // same prefix, multiple peers → conflict
+            }
         } else if (r == -1) {
-            conflict = 1;
+            conflict = 1;      // multiple routes in same peer → conflict
         }
     }
 
     pthread_mutex_unlock(&g_ad_global_peer_table->lock);
 
     if (conflict) {
-        /* multiple matches — set errno to EEXIST to indicate conflict (caller can interpret) */
         errno = EEXIST;
         return NULL;
     }
@@ -524,7 +544,6 @@ ad_transport_peer_t* ad_transport_peer_table_lookup(const struct sockaddr_in *ad
         errno = ENOENT;
         return NULL;
     }
-
     return best_peer;
 }
 
@@ -551,12 +570,12 @@ ad_peer_table_error_t ad_transport_peer_table_cleanup(void)
     return AD_PEER_TABLE_OK;
 }
 
-ad_transport_peer_table_t* ad_get_global_peer_table(void)
+ad_transport_peer_table_t* ad_transport_get_global_peer_table(void)
 {
     return g_ad_global_peer_table;
 }
 
-ad_transport_peer_table_t ad_get_global_peer_table_copy(void)
+ad_transport_peer_table_t ad_transport_get_global_peer_table_copy(void)
 {
     ad_transport_peer_table_t copy;
     memset(&copy, 0, sizeof(copy));
@@ -574,7 +593,7 @@ ad_transport_peer_table_t ad_get_global_peer_table_copy(void)
 }
 
 /* DB open: sets up tables */
-ad_peer_table_error_t ad_peer_table_db_open(const char *path)
+ad_peer_table_error_t ad_transport_peer_table_db_open(const char *path)
 {
     if (!path) return AD_PEER_TABLE_ERR_INVALID_ARGUMENT;
 
@@ -611,7 +630,7 @@ ad_peer_table_error_t ad_peer_table_db_open(const char *path)
 }
 
 /* DB load: loads peers and their routes */
-ad_peer_table_error_t ad_peer_table_db_load(void)
+ad_peer_table_error_t ad_transport_peer_table_db_load(void)
 {
     if (!g_db || !g_ad_global_peer_table) return AD_PEER_TABLE_ERR_INTERNAL;
 
@@ -685,7 +704,7 @@ ad_peer_table_error_t ad_peer_table_db_load(void)
 }
 
 /* DB save: truncates and writes entire table */
-ad_peer_table_error_t ad_peer_table_db_save(void)
+ad_peer_table_error_t ad_transport_peer_table_db_save(void)
 {
     if (!g_db || !g_ad_global_peer_table) return AD_PEER_TABLE_ERR_INTERNAL;
 
@@ -746,26 +765,26 @@ ad_peer_table_error_t ad_peer_table_db_save(void)
 }
 
 /* Persistence thread */
-static void* persist_thread_fn(void *arg)
+static void* ad_transport_persist_thread_fn(void *arg)
 {
     AD_LOG_TRANSPORT_INFO("Peer-table persistence thread started");
     while (g_run_persist) {
         sleep(g_ad_global_peer_table ? g_ad_global_peer_table->persist_interval_sec : DEFAULT_PERSIST_INTERVAL_SEC);
         if (!g_run_persist) break;
         if (g_db) {
-            ad_peer_table_db_save();
+            ad_transport_peer_table_db_save();
         }
     }
     AD_LOG_TRANSPORT_INFO("Peer-table persistence thread exiting");
     return NULL;
 }
 
-ad_peer_table_error_t ad_peer_table_start_persistence(void)
+ad_peer_table_error_t ad_transport_peer_table_start_persistence(void)
 {
     if (!g_ad_global_peer_table) return AD_PEER_TABLE_ERR_INTERNAL;
     if (g_run_persist) return AD_PEER_TABLE_OK; /* already running */
     g_run_persist = 1;
-    int r = pthread_create(&g_persist_thread, NULL, persist_thread_fn, NULL);
+    int r = pthread_create(&g_persist_thread, NULL, ad_transport_persist_thread_fn, NULL);
     if (r != 0) {
         AD_LOG_TRANSPORT_ERROR("Failed to start persist thread: %d", r);
         g_run_persist = 0;
@@ -774,7 +793,7 @@ ad_peer_table_error_t ad_peer_table_start_persistence(void)
     return AD_PEER_TABLE_OK;
 }
 
-ad_peer_table_error_t ad_peer_table_stop_persistence(void)
+ad_peer_table_error_t ad_transport_peer_table_stop_persistence(void)
 {
     if (!g_run_persist) return AD_PEER_TABLE_OK;
     g_run_persist = 0;
@@ -785,10 +804,10 @@ ad_peer_table_error_t ad_peer_table_stop_persistence(void)
     return AD_PEER_TABLE_OK;
 }
 
-ad_peer_table_error_t ad_peer_table_db_close(void)
+ad_peer_table_error_t ad_transport_peer_table_db_close(void)
 {
     /* Stop persistence thread first */
-    ad_peer_table_stop_persistence();
+    ad_transport_peer_table_stop_persistence();
 
     if (g_db) {
         sqlite3_close(g_db);
@@ -813,3 +832,535 @@ ad_transport_error_t ad_transport_map_peer_table_error(ad_peer_table_error_t e) 
             return AD_TRANSPORT_ERR_PEER_TABLE;
     }
 }
+
+/* =========================================================
+ * Internal state
+ * ========================================================= */
+
+static ad_transport_state_t g_state = AD_TRANSPORT_STATE_STOPPED;
+static ad_transport_stats_t g_stats;
+static int g_udp_fd = -1;
+
+/* =========================================================
+ * Helpers
+ * ========================================================= */
+
+static ad_transport_error_t
+map_errno_to_transport(void)
+{
+    switch (errno) {
+        case EINVAL: return AD_TRANSPORT_ERR_INVALID_ARGUMENT;
+        case ENOMEM: return AD_TRANSPORT_ERR_NO_MEMORY;
+        default:     return AD_TRANSPORT_ERR_IO;
+    }
+}
+
+static void
+stats_reset(void)
+{
+    memset(&g_stats, 0, sizeof(g_stats));
+}
+
+/* =========================================================
+ * Lifecycle
+ * ========================================================= */
+
+ad_transport_error_t
+ad_transport_init_with_config(const ad_transport_config_t *cfg)
+{
+    if (!cfg || !cfg->config_path || !cfg->db_path)
+        return AD_TRANSPORT_ERR_INVALID_ARGUMENT;
+
+    if (g_state != AD_TRANSPORT_STATE_STOPPED)
+        return AD_TRANSPORT_ERR_INVALID_ARGUMENT;
+
+    memset(&g_transport_config, 0, sizeof(g_transport_config));
+
+    g_transport_config.config_path = strdup(cfg->config_path);
+    g_transport_config.db_path     = strdup(cfg->db_path);
+    g_transport_config.persist_interval_sec = cfg->persist_interval_sec;
+    g_transport_config.udp_fd = -1;
+    g_transport_config.tun_fd = -1;
+
+    stats_reset();
+
+    /* Init peer table */
+    ad_transport_error_t te =
+        ad_transport_peer_table_init_from_config(cfg->config_path);
+    if (te != AD_TRANSPORT_OK)
+        return te;
+
+    /* Open DB */
+    if (ad_transport_peer_table_db_open(cfg->db_path) != AD_PEER_TABLE_OK)
+        return AD_TRANSPORT_ERR_PEER_TABLE;
+
+    if (ad_transport_peer_table_db_load() != AD_PEER_TABLE_OK)
+        return AD_TRANSPORT_ERR_PEER_TABLE;
+
+    /* Init TUN (delegated) */
+    ad_tun_config_t tun_cfg;
+    if (ad_tun_load_config(cfg->config_path, &tun_cfg) != AD_TUN_OK)
+        return AD_TRANSPORT_ERR_CONFIG;
+
+    if (ad_tun_init(&tun_cfg) != AD_TUN_OK)
+        return AD_TRANSPORT_ERR_INTERNAL;
+
+    ad_tun_free_config(&tun_cfg);
+
+    g_state = AD_TRANSPORT_STATE_STOPPED;
+    return AD_TRANSPORT_OK;
+}
+
+ad_transport_error_t
+ad_transport_start(void)
+{
+    if (g_state != AD_TRANSPORT_STATE_STOPPED)
+        return AD_TRANSPORT_ERR_INVALID_ARGUMENT;
+
+    /* UDP socket */
+    g_udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (g_udp_fd < 0)
+        return map_errno_to_transport();
+
+    fcntl(g_udp_fd, F_SETFL, O_NONBLOCK);
+
+    /* Start TUN */
+    if (ad_tun_start() != AD_TUN_OK)
+        return AD_TRANSPORT_ERR_INTERNAL;
+
+    /* Start persistence */
+    ad_transport_peer_table_start_persistence();
+
+    g_state = AD_TRANSPORT_STATE_RUNNING;
+    return AD_TRANSPORT_OK;
+}
+
+ad_transport_error_t
+ad_transport_stop(void)
+{
+    if (g_state != AD_TRANSPORT_STATE_RUNNING)
+        return AD_TRANSPORT_ERR_INVALID_ARGUMENT;
+
+    ad_transport_peer_table_stop_persistence();
+    ad_tun_stop();
+
+    if (g_udp_fd >= 0) {
+        close(g_udp_fd);
+        g_udp_fd = -1;
+    }
+
+    g_state = AD_TRANSPORT_STATE_STOPPED;
+    return AD_TRANSPORT_OK;
+}
+
+ad_transport_error_t
+ad_transport_stop_graceful(unsigned int timeout_ms)
+{
+    (void)timeout_ms; /* currently synchronous */
+    return ad_transport_stop();
+}
+
+ad_transport_error_t
+ad_transport_restart(void)
+{
+    ad_transport_stop();
+    return ad_transport_start();
+}
+
+ad_transport_state_t
+ad_transport_get_state(void)
+{
+    return g_state;
+}
+
+/* =========================================================
+ * FD access
+ * ========================================================= */
+
+ad_transport_error_t
+ad_transport_get_udp_fd(int *out_fd)
+{
+    if (!out_fd || g_udp_fd < 0)
+        return AD_TRANSPORT_ERR_INVALID_ARGUMENT;
+
+    *out_fd = g_udp_fd;
+    return AD_TRANSPORT_OK;
+}
+
+ad_transport_error_t
+ad_transport_get_tun_fd(int *out_fd)
+{
+    if (!out_fd)
+        return AD_TRANSPORT_ERR_INVALID_ARGUMENT;
+
+    int fd = ad_tun_get_fd();
+    if (fd < 0)
+        return AD_TRANSPORT_ERR_INTERNAL;
+
+    *out_fd = fd;
+    return AD_TRANSPORT_OK;
+}
+
+/* =========================================================
+ * Message helpers
+ * ========================================================= */
+
+ad_transport_error_t
+ad_transport_pack_header(uint8_t *buf, size_t buf_len,
+                         uint8_t msg_type, uint16_t msg_len)
+{
+    if (!buf || buf_len < 3)
+        return AD_TRANSPORT_ERR_INVALID_ARGUMENT;
+
+    buf[0] = msg_type;
+    buf[1] = (msg_len >> 8) & 0xff;
+    buf[2] = msg_len & 0xff;
+    return AD_TRANSPORT_OK;
+}
+
+ad_transport_error_t
+ad_transport_unpack_header(const uint8_t *buf, size_t buf_len,
+                           uint8_t *msg_type, uint16_t *msg_len)
+{
+    if (!buf || buf_len < 3 || !msg_type || !msg_len)
+        return AD_TRANSPORT_ERR_INVALID_ARGUMENT;
+
+    *msg_type = buf[0];
+    *msg_len  = ((uint16_t)buf[1] << 8) | buf[2];
+    return AD_TRANSPORT_OK;
+}
+
+/* =========================================================
+ * Encryption (stubbed cleanly)
+ * ========================================================= */
+
+ad_transport_error_t
+ad_transport_encrypt_message(const uint8_t *pt, size_t pt_len,
+                             uint8_t **ct, size_t *ct_len)
+{
+    if (!pt || !ct || !ct_len)
+        return AD_TRANSPORT_ERR_INVALID_ARGUMENT;
+
+    *ct = malloc(pt_len);
+    if (!*ct)
+        return AD_TRANSPORT_ERR_NO_MEMORY;
+
+    memcpy(*ct, pt, pt_len);
+    *ct_len = pt_len;
+    return AD_TRANSPORT_OK;
+}
+
+ad_transport_error_t
+ad_transport_decrypt_message(const uint8_t *ct, size_t ct_len,
+                             uint8_t **pt, size_t *pt_len)
+{
+    return ad_transport_encrypt_message(ct, ct_len, pt, pt_len);
+}
+
+void
+ad_transport_free_message(uint8_t *buf)
+{
+    free(buf);
+}
+
+/* =========================================================
+ * UDP I/O
+ * ========================================================= */
+
+ad_transport_error_t
+ad_transport_read_udp_message(int fd, uint8_t **out_buf, uint16_t *out_len)
+{
+    if (!out_buf || !out_len)
+        return AD_TRANSPORT_ERR_INVALID_ARGUMENT;
+
+    uint8_t *buf = malloc(2048);
+    if (!buf)
+        return AD_TRANSPORT_ERR_NO_MEMORY;
+
+    ssize_t r = recv(fd, buf, 2048, 0);
+    if (r <= 0) {
+        free(buf);
+        return AD_TRANSPORT_ERR_IO;
+    }
+
+    *out_buf = buf;
+    *out_len = (uint16_t)r;
+    g_stats.udp_rx++;
+    return AD_TRANSPORT_OK;
+}
+
+ad_transport_error_t
+ad_transport_write_udp_message(int fd, const uint8_t *buf, uint16_t len)
+{
+    ssize_t w = send(fd, buf, len, 0);
+    if (w < 0)
+        return AD_TRANSPORT_ERR_IO;
+
+    g_stats.udp_tx++;
+    return AD_TRANSPORT_OK;
+}
+
+/* =========================================================
+ * TUN I/O
+ * ========================================================= */
+
+ad_transport_error_t
+ad_transport_read_tun_message(char *buf, size_t buf_len, ssize_t *out_len)
+{
+    ssize_t r = ad_tun_read(buf, buf_len);
+    if (r < 0)
+        return AD_TRANSPORT_ERR_IO;
+
+    *out_len = r;
+    g_stats.tun_rx++;
+    return AD_TRANSPORT_OK;
+}
+
+ad_transport_error_t
+ad_transport_write_tun_message(const char *buf, size_t buf_len, ssize_t *out_len)
+{
+    ssize_t w = ad_tun_write(buf, buf_len);
+    if (w < 0)
+        return AD_TRANSPORT_ERR_IO;
+
+    *out_len = w;
+    g_stats.tun_tx++;
+    return AD_TRANSPORT_OK;
+}
+
+/* =========================================================
+ * Event handlers
+ * ========================================================= */
+
+ad_transport_error_t
+ad_transport_handle_tun_event(void)
+{
+    uint8_t buf[2048];
+    ssize_t len;
+
+    if (ad_transport_read_tun_message((char *)buf, sizeof(buf), &len) != AD_TRANSPORT_OK)
+        return AD_TRANSPORT_ERR_IO;
+
+    struct sockaddr_in dst;
+    memcpy(&dst.sin_addr, buf + 16, sizeof(uint32_t));
+
+    ad_transport_peer_t *peer =
+        ad_transport_peer_table_lookup(&dst);
+    if (!peer) {
+        g_stats.dropped_packets++;
+        return AD_TRANSPORT_ERR_NOT_FOUND;
+    }
+
+    return ad_transport_write_udp_message(
+        g_udp_fd, buf, (uint16_t)len);
+}
+
+ad_transport_error_t
+ad_transport_handle_udp_event(void)
+{
+    uint8_t *buf;
+    uint16_t len;
+
+    if (ad_transport_read_udp_message(g_udp_fd, &buf, &len) != AD_TRANSPORT_OK)
+        return AD_TRANSPORT_ERR_IO;
+
+    ssize_t w;
+    ad_transport_write_tun_message((char *)buf, len, &w);
+    ad_transport_free_message(buf);
+    return AD_TRANSPORT_OK;
+}
+
+/* =========================================================
+ * Stats
+ * ========================================================= */
+
+ad_transport_error_t
+ad_transport_get_stats(ad_transport_stats_t *out)
+{
+    if (!out)
+        return AD_TRANSPORT_ERR_INVALID_ARGUMENT;
+
+    *out = g_stats;
+    return AD_TRANSPORT_OK;
+}
+
+/* =========================================================
+ * Peer active state management
+ * ========================================================= */
+ad_peer_table_error_t
+ad_transport_peer_table_set_active(const char *peer_id, int active)
+{
+    if (!peer_id || !g_ad_global_peer_table)
+        return AD_PEER_TABLE_ERR_INVALID_ARGUMENT;
+
+    pthread_mutex_lock(&g_ad_global_peer_table->lock);
+
+    for (size_t i = 0; i < g_ad_global_peer_table->count; i++) {
+        ad_transport_peer_t *p = &g_ad_global_peer_table->entries[i];
+
+        if (p->peer_id && strcmp(p->peer_id, peer_id) == 0) {
+            p->active = active ? 1 : 0;
+            pthread_mutex_unlock(&g_ad_global_peer_table->lock);
+            return AD_PEER_TABLE_OK;
+        }
+    }
+
+    pthread_mutex_unlock(&g_ad_global_peer_table->lock);
+    return AD_PEER_TABLE_ERR_NOT_FOUND;
+}
+
+/* Update an existing peer's info (routes, addr, active) 
+
+Usage Example:
+----------------------
+ad_transport_peer_t p = {0};
+p.peer_id = "peer1";
+p.active = 1;
+p.real_addr = addr;
+p.routes = routes;
+p.route_prefixlen = prefixes;
+p.route_count = n;
+
+ad_transport_peer_table_update(&p);
+
+*/
+ad_peer_table_error_t
+ad_transport_peer_table_update(ad_transport_peer_t *peer)
+{
+    if (!peer || !peer->peer_id || !g_ad_global_peer_table)
+        return AD_PEER_TABLE_ERR_INVALID_ARGUMENT;
+
+    pthread_mutex_lock(&g_ad_global_peer_table->lock);
+
+    for (size_t i = 0; i < g_ad_global_peer_table->count; i++) {
+        ad_transport_peer_t *dst = &g_ad_global_peer_table->entries[i];
+
+        if (dst->peer_id && strcmp(dst->peer_id, peer->peer_id) == 0) {
+
+            /* Prepare new route storage first (fail-safe) */
+            struct sockaddr_in *new_routes = NULL;
+            uint8_t *new_prefix = NULL;
+
+            if (peer->route_count > 0) {
+                new_routes = calloc(peer->route_count, sizeof(*new_routes));
+                new_prefix = calloc(peer->route_count, sizeof(*new_prefix));
+                if (!new_routes || !new_prefix) {
+                    free(new_routes);
+                    free(new_prefix);
+                    pthread_mutex_unlock(&g_ad_global_peer_table->lock);
+                    return AD_PEER_TABLE_ERR_NO_MEMORY;
+                }
+
+                for (size_t r = 0; r < peer->route_count; r++) {
+                    new_routes[r] = peer->routes[r];
+                    new_prefix[r] = peer->route_prefixlen[r];
+                }
+            }
+
+            /* Replace simple fields */
+            dst->real_addr = peer->real_addr;
+            dst->active    = peer->active;
+
+            /* Replace routes atomically */
+            free(dst->routes);
+            free(dst->route_prefixlen);
+
+            dst->routes = new_routes;
+            dst->route_prefixlen = new_prefix;
+            dst->route_count = peer->route_count;
+
+            pthread_mutex_unlock(&g_ad_global_peer_table->lock);
+            return AD_PEER_TABLE_OK;
+        }
+    }
+
+    pthread_mutex_unlock(&g_ad_global_peer_table->lock);
+    return AD_PEER_TABLE_ERR_NOT_FOUND;
+}
+
+/* Iterate over all peers, invoking callback for each 
+Usage Example:
+----------------------
+static int dump_peer(const ad_transport_peer_t *p, void *u)
+{
+    printf("peer=%s routes=%zu active=%d\n",
+           p->peer_id, p->route_count, p->active);
+    return 0;
+}
+
+ad_transport_peer_table_foreach(dump_peer, NULL);
+
+*/
+ad_peer_table_error_t
+ad_transport_peer_table_foreach(ad_peer_iter_cb cb, void *user)
+{
+    if (!cb || !g_ad_global_peer_table)
+        return AD_PEER_TABLE_ERR_INVALID_ARGUMENT;
+
+    /* Step 1: take a snapshot under lock */
+    pthread_mutex_lock(&g_ad_global_peer_table->lock);
+
+    size_t count = g_ad_global_peer_table->count;
+    ad_transport_peer_t *snapshot =
+        calloc(count, sizeof(ad_transport_peer_t));
+
+    if (!snapshot) {
+        pthread_mutex_unlock(&g_ad_global_peer_table->lock);
+        return AD_PEER_TABLE_ERR_NO_MEMORY;
+    }
+
+    for (size_t i = 0; i < count; i++) {
+        ad_transport_peer_t *src = &g_ad_global_peer_table->entries[i];
+        ad_transport_peer_t *dst = &snapshot[i];
+
+        /* Shallow copy first */
+        *dst = *src;
+
+        /* Deep copy owned fields */
+        if (src->peer_id)
+            dst->peer_id = strdup(src->peer_id);
+
+        if (src->route_count > 0) {
+            dst->routes = calloc(src->route_count, sizeof(*dst->routes));
+            dst->route_prefixlen = calloc(src->route_count, sizeof(*dst->route_prefixlen));
+
+            if (!dst->routes || !dst->route_prefixlen) {
+                pthread_mutex_unlock(&g_ad_global_peer_table->lock);
+                goto fail;
+            }
+
+            for (size_t r = 0; r < src->route_count; r++) {
+                dst->routes[r] = src->routes[r];
+                dst->route_prefixlen[r] = src->route_prefixlen[r];
+            }
+        }
+    }
+
+    pthread_mutex_unlock(&g_ad_global_peer_table->lock);
+
+    /* Step 2: invoke callbacks without holding lock */
+    for (size_t i = 0; i < count; i++) {
+        if (cb(&snapshot[i], user) != 0)
+            break;
+    }
+
+    /* Step 3: cleanup snapshot */
+    for (size_t i = 0; i < count; i++) {
+        free(snapshot[i].peer_id);
+        free(snapshot[i].routes);
+        free(snapshot[i].route_prefixlen);
+    }
+    free(snapshot);
+
+    return AD_PEER_TABLE_OK;
+
+fail:
+    for (size_t i = 0; i < count; i++) {
+        free(snapshot[i].peer_id);
+        free(snapshot[i].routes);
+        free(snapshot[i].route_prefixlen);
+    }
+    free(snapshot);
+    return AD_PEER_TABLE_ERR_NO_MEMORY;
+}
+

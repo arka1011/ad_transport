@@ -10,6 +10,7 @@ target_include_directories(ad_transport_tests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${CMAKE_CURRENT_SOURCE_DIR}/../../prebuilt/inih/include
     ${CMAKE_CURRENT_SOURCE_DIR}/../ad_logger/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/../ad_tun/include
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../prebuilt/googletest/googletest/include
     # Additional include directories can be added here
 )
@@ -19,6 +20,11 @@ target_include_directories(ad_transport_tests PRIVATE
 add_library(libad_logger SHARED IMPORTED)
 set_target_properties(libad_logger PROPERTIES
     IMPORTED_LOCATION "${CMAKE_CURRENT_SOURCE_DIR}/../../ad_logger/build/lib/libad_logger.so"
+)
+
+add_library(libad_tun SHARED IMPORTED)
+set_target_properties(libad_tun PROPERTIES
+    IMPORTED_LOCATION "${CMAKE_CURRENT_SOURCE_DIR}/../../ad_tun/build/lib/libad_tun.so"
 )
 
 add_library(gtest STATIC IMPORTED)
@@ -40,6 +46,7 @@ target_link_libraries(ad_transport_tests PRIVATE
     sqlite3
     ad_transport
     libad_logger
+    libad_tun
     gtest
     pthread
 )
