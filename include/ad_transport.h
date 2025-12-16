@@ -101,8 +101,6 @@ typedef struct {
  * ============================================================ */
 typedef struct {
     char *config_path;                 /* INI configuration path */
-    int udp_fd;                        /* Pre-created UDP socket */
-    int tun_fd;                        /* Pre-created TUN fd */
 } ad_transport_config_t;
 
 /* ============================================================
@@ -185,7 +183,8 @@ ad_transport_read_udp_message(int fd, uint8_t **out_buf, uint16_t *out_len);
 
 /* Write UDP message */
 ad_transport_error_t
-ad_transport_write_udp_message(int fd, const uint8_t *buf, uint16_t buf_len);
+ad_transport_write_udp_message(int fd, const uint8_t *buf, uint16_t buf_len,
+                               const struct sockaddr_in *peer_addr);
 
 /* Read/write TUN payload */
 ad_transport_error_t

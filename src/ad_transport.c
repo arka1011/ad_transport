@@ -20,6 +20,9 @@
 #include <arpa/inet.h>
 #include <time.h>
 #include <sqlite3.h>
+#include <netinet/ip.h>
+#include <netinet/in.h>
+
 
 /* ============================
  * Logging Macros are expected
@@ -30,6 +33,7 @@
 /* Defaults */
 #define DEFAULT_INITIAL_CAPACITY 16
 #define DEFAULT_PERSIST_INTERVAL_SEC 120
+static const int port = 6000; // Set your desired VPN port here
 
 /* Global definitions */
 ad_transport_peer_table_t *g_ad_global_peer_table = NULL;
@@ -722,7 +726,7 @@ ad_peer_table_error_t ad_transport_peer_table_db_save(void)
     sqlite3_exec(g_db, "DELETE FROM peer_routes;", NULL, NULL, NULL);
     sqlite3_exec(g_db, "DELETE FROM peers;", NULL, NULL, NULL);
 
-    AD_LOG_TRANSPORT_DEBUG("Saving %zu peers to DB", g_ad_global_peer_table->count);
+    //AD_LOG_TRANSPORT_DEBUG("Saving %zu peers to DB", g_ad_global_peer_table->count);
     for (size_t i = 0; i < g_ad_global_peer_table->count; i++) {
         ad_transport_peer_t *p = &g_ad_global_peer_table->entries[i];
         char ipbuf[INET_ADDRSTRLEN];
@@ -738,7 +742,7 @@ ad_peer_table_error_t ad_transport_peer_table_db_save(void)
             sqlite3_bind_int(ins1, 4, p->active);
             sqlite3_step(ins1);
             sqlite3_finalize(ins1);
-            AD_LOG_TRANSPORT_DEBUG("Saved peer %s to DB", p->peer_id);
+            //AD_LOG_TRANSPORT_DEBUG("Saved peer %s to DB", p->peer_id);
         } else {
             AD_LOG_TRANSPORT_ERROR("Failed to prepare peer insert for %s", p->peer_id);
         }
@@ -754,7 +758,7 @@ ad_peer_table_error_t ad_transport_peer_table_db_save(void)
                 sqlite3_bind_int(ins2, 3, p->route_prefixlen[r]);
                 sqlite3_step(ins2);
                 sqlite3_finalize(ins2);
-                AD_LOG_TRANSPORT_DEBUG("Saved route %s for peer %s to DB", cidrbuf, p->peer_id);
+                //AD_LOG_TRANSPORT_DEBUG("Saved route %s for peer %s to DB", cidrbuf, p->peer_id);
             } else {
                 AD_LOG_TRANSPORT_ERROR("Failed to prepare route insert for %s route %s", p->peer_id, cidrbuf);
             }
@@ -771,7 +775,6 @@ ad_peer_table_error_t ad_transport_peer_table_db_save(void)
     }
 
     pthread_mutex_unlock(&g_ad_global_peer_table->lock);
-    AD_LOG_TRANSPORT_DEBUG("Saved peers to DB");
     return AD_PEER_TABLE_OK;
 }
 
@@ -888,8 +891,6 @@ ad_transport_init_with_config(const ad_transport_config_t *cfg)
     memset(&g_transport_config, 0, sizeof(g_transport_config));
 
     g_transport_config.config_path = strdup(cfg->config_path);
-    g_transport_config.udp_fd = -1;
-    g_transport_config.tun_fd = -1;
 
     stats_reset();
 
@@ -933,6 +934,19 @@ ad_transport_start(void)
 
     fcntl(g_udp_fd, F_SETFL, O_NONBLOCK);
 
+    /* Bind UDP socket to a specific port */
+    struct sockaddr_in addr = {0};
+
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY; // Listen on all interfaces
+    addr.sin_port = htons(port);
+
+    if (bind(g_udp_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("bind");
+        close(g_udp_fd);
+        return AD_TRANSPORT_ERR_INTERNAL;
+    }
+
     /* Start TUN */
     if (ad_tun_start() != AD_TUN_OK)
         return AD_TRANSPORT_ERR_INTERNAL;
@@ -943,6 +957,7 @@ ad_transport_start(void)
     g_state = AD_TRANSPORT_STATE_RUNNING;
     return AD_TRANSPORT_OK;
 }
+
 
 ad_transport_error_t
 ad_transport_stop(void)
@@ -1100,11 +1115,35 @@ ad_transport_read_udp_message(int fd, uint8_t **out_buf, uint16_t *out_len)
 }
 
 ad_transport_error_t
-ad_transport_write_udp_message(int fd, const uint8_t *buf, uint16_t len)
+ad_transport_write_udp_message(
+    int fd,
+    const uint8_t *buf,
+    uint16_t len,
+    const struct sockaddr_in *peer_addr)
 {
-    ssize_t w = send(fd, buf, len, 0);
-    if (w < 0)
+    if (!buf || !peer_addr || len == 0)
+        return AD_TRANSPORT_ERR_INVALID_ARGUMENT;
+
+    AD_LOG_TRANSPORT_DEBUG(
+            "Sending UDP message of %u bytes to %s:%u",
+            len,
+            inet_ntoa(peer_addr->sin_addr),
+            ntohs(peer_addr->sin_port));
+
+    ssize_t w = sendto(fd, buf, len, 0, (const struct sockaddr *)peer_addr, sizeof(*peer_addr));
+
+    if (w < 0) {
+        AD_LOG_TRANSPORT_ERROR(
+            "UDP sendto failed (errno=%d: %s)",
+            errno, strerror(errno));
         return AD_TRANSPORT_ERR_IO;
+    }
+
+    if (w != len) {
+        AD_LOG_TRANSPORT_ERROR(
+            "UDP partial send (%zd/%u bytes)", w, len);
+        return AD_TRANSPORT_ERR_IO;
+    }
 
     g_stats.udp_tx++;
     return AD_TRANSPORT_OK;
@@ -1151,31 +1190,76 @@ ad_transport_handle_tun_event(void)
     if (ad_transport_read_tun_message((char *)buf, sizeof(buf), &len) != AD_TRANSPORT_OK)
         return AD_TRANSPORT_ERR_IO;
 
+    /* Interpret buffer as IPv4 header */
+    struct iphdr *ip = (struct iphdr *)buf;
+
+    /* Sanity check */
+    if (ip->version != 4) {
+        AD_LOG_TUN_DEBUG("Non-IPv4 packet received, dropping");
+        return AD_TRANSPORT_ERR_NOT_FOUND;
+    }
+
     struct sockaddr_in dst;
-    memcpy(&dst.sin_addr, buf + 16, sizeof(uint32_t));
+    memset(&dst, 0, sizeof(dst));
+    dst.sin_family = AF_INET;
+    dst.sin_addr.s_addr = ip->daddr;  // already in network byte order
+
+    AD_LOG_TUN_DEBUG("TUN packet dst=%s",
+                     inet_ntoa(dst.sin_addr));
 
     ad_transport_peer_t *peer =
         ad_transport_peer_table_lookup(&dst);
+
     if (!peer) {
+        AD_LOG_TUN_DEBUG("No peer found for destination %s, dropping packet",
+                         inet_ntoa(dst.sin_addr));
         g_stats.dropped_packets++;
         return AD_TRANSPORT_ERR_NOT_FOUND;
     }
 
     return ad_transport_write_udp_message(
-        g_udp_fd, buf, (uint16_t)len);
+        g_udp_fd, buf, (uint16_t)len, &peer->real_addr);
 }
+
 
 ad_transport_error_t
 ad_transport_handle_udp_event(void)
 {
-    uint8_t *buf;
-    uint16_t len;
+    uint8_t *buf = NULL;
+    uint16_t len = 0;
 
-    if (ad_transport_read_udp_message(g_udp_fd, &buf, &len) != AD_TRANSPORT_OK)
+    if (ad_transport_read_udp_message(g_udp_fd, &buf, &len)
+        != AD_TRANSPORT_OK) {
         return AD_TRANSPORT_ERR_IO;
+    }
 
-    ssize_t w;
-    ad_transport_write_tun_message((char *)buf, len, &w);
+    if (len < sizeof(struct iphdr)) {
+        AD_LOG_TRANSPORT_ERROR("UDP packet too small (%u bytes)", len);
+        ad_transport_free_message(buf);
+        return AD_TRANSPORT_ERR_INTERNAL;
+    }
+
+    struct iphdr *ip = (struct iphdr *)buf;
+
+    if (ip->version != 4) {
+        AD_LOG_GENERAL_ERROR("Non-IPv4 packet received over UDP");
+        ad_transport_free_message(buf);
+        return AD_TRANSPORT_ERR_INTERNAL;
+    }
+
+    AD_LOG_TRANSPORT_DEBUG("ad_tun_get_fd(): %d", ad_tun_get_fd());
+    ssize_t w = write(ad_tun_get_fd(), buf, len);
+    if (w != len) {
+        AD_LOG_TRANSPORT_ERROR("Failed to write UDP packet to TUN");
+        ad_transport_free_message(buf);
+        return AD_TRANSPORT_ERR_IO;
+    }
+
+    AD_LOG_TRANSPORT_DEBUG(
+        "Injected %u bytes into TUN (dst=%s)",
+        len,
+        inet_ntoa(*(struct in_addr *)&ip->daddr));
+
     ad_transport_free_message(buf);
     return AD_TRANSPORT_OK;
 }
