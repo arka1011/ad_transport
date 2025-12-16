@@ -101,10 +101,8 @@ typedef struct {
  * ============================================================ */
 typedef struct {
     char *config_path;                 /* INI configuration path */
-    char *db_path;                     /* Peer DB path */
     int udp_fd;                        /* Pre-created UDP socket */
     int tun_fd;                        /* Pre-created TUN fd */
-    unsigned int persist_interval_sec; /* Persistence interval */
 } ad_transport_config_t;
 
 /* ============================================================

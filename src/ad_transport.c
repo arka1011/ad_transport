@@ -642,14 +642,16 @@ ad_peer_table_error_t ad_transport_peer_table_db_load(void)
     }
 
     /* clear current table before load */
-    pthread_mutex_lock(&g_ad_global_peer_table->lock);
+    /*pthread_mutex_lock(&g_ad_global_peer_table->lock);
     for (size_t i = 0; i < g_ad_global_peer_table->count; i++) {
         free(g_ad_global_peer_table->entries[i].peer_id);
         free(g_ad_global_peer_table->entries[i].routes);
         free(g_ad_global_peer_table->entries[i].route_prefixlen);
     }
+    
     g_ad_global_peer_table->count = 0;
     pthread_mutex_unlock(&g_ad_global_peer_table->lock);
+    */
 
     while (sqlite3_step(s1) == SQLITE_ROW) {
         ad_transport_peer_t peer;
@@ -669,7 +671,7 @@ ad_peer_table_error_t ad_transport_peer_table_db_load(void)
 
         /* load routes for this peer */
         if (sqlite3_prepare_v2(g_db, "SELECT cidr, prefix FROM peer_routes WHERE peer_id=?;", -1, &s2, NULL) == SQLITE_OK) {
-            sqlite3_bind_text(s2, 1, (const char*)idtxt, -1, SQLITE_STATIC);
+            sqlite3_bind_text(s2, 1, (const char*)idtxt, -1, SQLITE_TRANSIENT);
             while (sqlite3_step(s2) == SQLITE_ROW) {
                 const unsigned char *cidr = sqlite3_column_text(s2, 0);
                 int prefix = sqlite3_column_int(s2, 1);
@@ -720,6 +722,7 @@ ad_peer_table_error_t ad_transport_peer_table_db_save(void)
     sqlite3_exec(g_db, "DELETE FROM peer_routes;", NULL, NULL, NULL);
     sqlite3_exec(g_db, "DELETE FROM peers;", NULL, NULL, NULL);
 
+    AD_LOG_TRANSPORT_DEBUG("Saving %zu peers to DB", g_ad_global_peer_table->count);
     for (size_t i = 0; i < g_ad_global_peer_table->count; i++) {
         ad_transport_peer_t *p = &g_ad_global_peer_table->entries[i];
         char ipbuf[INET_ADDRSTRLEN];
@@ -729,12 +732,15 @@ ad_peer_table_error_t ad_transport_peer_table_db_save(void)
         /* Insert peer */
         sqlite3_stmt *ins1 = NULL;
         if (sqlite3_prepare_v2(g_db, "INSERT INTO peers (id, real_ip, real_port, active) VALUES (?, ?, ?, ?);", -1, &ins1, NULL) == SQLITE_OK) {
-            sqlite3_bind_text(ins1, 1, p->peer_id, -1, SQLITE_STATIC);
-            sqlite3_bind_text(ins1, 2, ipbuf, -1, SQLITE_STATIC);
+            sqlite3_bind_text(ins1, 1, p->peer_id, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(ins1, 2, ipbuf, -1, SQLITE_TRANSIENT);
             sqlite3_bind_int(ins1, 3, port);
             sqlite3_bind_int(ins1, 4, p->active);
             sqlite3_step(ins1);
             sqlite3_finalize(ins1);
+            AD_LOG_TRANSPORT_DEBUG("Saved peer %s to DB", p->peer_id);
+        } else {
+            AD_LOG_TRANSPORT_ERROR("Failed to prepare peer insert for %s", p->peer_id);
         }
 
         /* insert routes */
@@ -743,11 +749,14 @@ ad_peer_table_error_t ad_transport_peer_table_db_save(void)
             make_cidr_string(&p->routes[r], p->route_prefixlen[r], cidrbuf, sizeof(cidrbuf));
             sqlite3_stmt *ins2 = NULL;
             if (sqlite3_prepare_v2(g_db, "INSERT INTO peer_routes (peer_id, cidr, prefix) VALUES (?, ?, ?);", -1, &ins2, NULL) == SQLITE_OK) {
-                sqlite3_bind_text(ins2, 1, p->peer_id, -1, SQLITE_STATIC);
-                sqlite3_bind_text(ins2, 2, cidrbuf, -1, SQLITE_STATIC);
+                sqlite3_bind_text(ins2, 1, p->peer_id, -1, SQLITE_TRANSIENT);
+                sqlite3_bind_text(ins2, 2, cidrbuf, -1, SQLITE_TRANSIENT);
                 sqlite3_bind_int(ins2, 3, p->route_prefixlen[r]);
                 sqlite3_step(ins2);
                 sqlite3_finalize(ins2);
+                AD_LOG_TRANSPORT_DEBUG("Saved route %s for peer %s to DB", cidrbuf, p->peer_id);
+            } else {
+                AD_LOG_TRANSPORT_ERROR("Failed to prepare route insert for %s route %s", p->peer_id, cidrbuf);
             }
         }
     }
@@ -757,6 +766,8 @@ ad_peer_table_error_t ad_transport_peer_table_db_save(void)
         sqlite3_free(err);
         pthread_mutex_unlock(&g_ad_global_peer_table->lock);
         return AD_PEER_TABLE_ERR_DB_WRITE;
+    } else {
+        AD_LOG_TRANSPORT_INFO("DB save committed successfully");
     }
 
     pthread_mutex_unlock(&g_ad_global_peer_table->lock);
@@ -868,7 +879,7 @@ stats_reset(void)
 ad_transport_error_t
 ad_transport_init_with_config(const ad_transport_config_t *cfg)
 {
-    if (!cfg || !cfg->config_path || !cfg->db_path)
+    if (!cfg || !cfg->config_path)
         return AD_TRANSPORT_ERR_INVALID_ARGUMENT;
 
     if (g_state != AD_TRANSPORT_STATE_STOPPED)
@@ -877,8 +888,6 @@ ad_transport_init_with_config(const ad_transport_config_t *cfg)
     memset(&g_transport_config, 0, sizeof(g_transport_config));
 
     g_transport_config.config_path = strdup(cfg->config_path);
-    g_transport_config.db_path     = strdup(cfg->db_path);
-    g_transport_config.persist_interval_sec = cfg->persist_interval_sec;
     g_transport_config.udp_fd = -1;
     g_transport_config.tun_fd = -1;
 
@@ -891,7 +900,7 @@ ad_transport_init_with_config(const ad_transport_config_t *cfg)
         return te;
 
     /* Open DB */
-    if (ad_transport_peer_table_db_open(cfg->db_path) != AD_PEER_TABLE_OK)
+    if (ad_transport_peer_table_db_open(g_ad_global_peer_table->db_path) != AD_PEER_TABLE_OK)
         return AD_TRANSPORT_ERR_PEER_TABLE;
 
     if (ad_transport_peer_table_db_load() != AD_PEER_TABLE_OK)
@@ -943,6 +952,7 @@ ad_transport_stop(void)
 
     ad_transport_peer_table_stop_persistence();
     ad_tun_stop();
+    ad_tun_cleanup();
 
     if (g_udp_fd >= 0) {
         close(g_udp_fd);
