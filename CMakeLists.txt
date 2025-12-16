@@ -10,33 +10,32 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
 
-# Source files
+# ---- SOURCES ----
 set(INIH_SRC
     ${CMAKE_CURRENT_SOURCE_DIR}/../../prebuilt/inih/src/ini.c
 )
 
-set(AD_TRANSPORT_SOURCES
+add_library(ad_transport SHARED
     src/ad_transport.c
     ${INIH_SRC}
 )
 
-# ---- CREATE THE TARGET FIRST ----
-add_library(ad_transport SHARED ${AD_TRANSPORT_SOURCES})
-
-# ---- ADD INCLUDE DIRS ----
-target_include_directories(ad_transport PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../prebuilt/inih/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/../ad_logger/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/../ad_tun/include)
+# ---- INCLUDE DIRS ----
+target_include_directories(ad_transport
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../prebuilt/inih/include
+)
 
 # ---- LINK LIBRARIES ----
 target_link_libraries(ad_transport
-    ${CMAKE_CURRENT_SOURCE_DIR}/../ad_logger/build/lib/libad_logger.so
-    ${CMAKE_CURRENT_SOURCE_DIR}/../ad_tun/build/lib/libad_tun.so
-    sqlite3
+    PUBLIC
+        ad_logger
+        ad_tun
+    PRIVATE
+        sqlite3
 )
 
 enable_testing()
 add_subdirectory(tests)
-

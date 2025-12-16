@@ -2,53 +2,50 @@
 add_executable(ad_transport_tests
     test_main.cpp
     test_peer_table_db.cpp
-    # Additional test source files can be added here
 )
 
-# ---- ADD INCLUDE DIRS ----
+# ---- INCLUDE DIRS ----
 target_include_directories(ad_transport_tests PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../prebuilt/inih/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/../ad_logger/include
-    ${CMAKE_CURRENT_SOURCE_DIR}/../ad_tun/include
     ${CMAKE_CURRENT_SOURCE_DIR}/../../../prebuilt/googletest/googletest/include
-    # Additional include directories can be added here
 )
 
-# ---- IMPORT LIBRARIES START ----
-
-add_library(libad_logger SHARED IMPORTED)
-set_target_properties(libad_logger PROPERTIES
-    IMPORTED_LOCATION "${CMAKE_CURRENT_SOURCE_DIR}/../../ad_logger/build/lib/libad_logger.so"
-)
-
-add_library(libad_tun SHARED IMPORTED)
-set_target_properties(libad_tun PROPERTIES
-    IMPORTED_LOCATION "${CMAKE_CURRENT_SOURCE_DIR}/../../ad_tun/build/lib/libad_tun.so"
-)
-
+# ---- IMPORT GTEST ----
 add_library(gtest STATIC IMPORTED)
 set_target_properties(gtest PROPERTIES
-    IMPORTED_LOCATION "${CMAKE_CURRENT_SOURCE_DIR}/../../../prebuilt/googletest/build/lib/libgtest.a"
+    IMPORTED_LOCATION
+        "${CMAKE_CURRENT_SOURCE_DIR}/../../../prebuilt/googletest/build/lib/libgtest.a"
 )
 
 add_library(gtest_main STATIC IMPORTED)
 set_target_properties(gtest_main PROPERTIES
-    IMPORTED_LOCATION "${CMAKE_CURRENT_SOURCE_DIR}/../../../prebuilt/googletest/build/lib/libgtest_main.a"
+    IMPORTED_LOCATION
+        "${CMAKE_CURRENT_SOURCE_DIR}/../../../prebuilt/googletest/build/lib/libgtest_main.a"
 )
-
-# additional libraries can be added here
-
-# ---- IMPORT LIBRARIES END ----
 
 # ---- LINK LIBRARIES ----
 target_link_libraries(ad_transport_tests PRIVATE
-    sqlite3
     ad_transport
-    libad_logger
-    libad_tun
     gtest
+    gtest_main
     pthread
 )
 
 add_test(NAME ad_transport_tests COMMAND ad_transport_tests)
+
+# ---- COPY CONFIG FILES ----
+file(GLOB CONFIG_FILES
+    ${CMAKE_CURRENT_SOURCE_DIR}/../test_configs/*
+)
+
+file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/configs)
+
+foreach(CONFIG_FILE ${CONFIG_FILES})
+    get_filename_component(CONFIG_NAME ${CONFIG_FILE} NAME)
+
+    configure_file(
+        ${CONFIG_FILE}
+        ${CMAKE_CURRENT_BINARY_DIR}/configs/${CONFIG_NAME}
+        COPYONLY
+    )
+endforeach()
