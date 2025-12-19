@@ -1247,7 +1247,7 @@ ad_transport_handle_udp_event(void)
         return AD_TRANSPORT_ERR_INTERNAL;
     }
 
-    AD_LOG_TRANSPORT_DEBUG("ad_tun_get_fd(): %d", ad_tun_get_fd());
+    //AD_LOG_TRANSPORT_DEBUG("ad_tun_get_fd(): %d", ad_tun_get_fd());
     ssize_t w = write(ad_tun_get_fd(), buf, len);
     if (w != len) {
         AD_LOG_TRANSPORT_ERROR("Failed to write UDP packet to TUN");
