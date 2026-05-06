@@ -1181,6 +1181,30 @@ ad_transport_write_tun_message(const char *buf, size_t buf_len, ssize_t *out_len
  * Event handlers
  * ========================================================= */
 
+/* Helper function to calculate IPv4 header checksum */
+static uint16_t compute_ip_checksum(const uint8_t *buf, size_t len)
+{
+    uint32_t sum = 0;
+    const uint16_t *words = (const uint16_t *)buf;
+
+    /* Sum all 16-bit words */
+    for (size_t i = 0; i < len / 2; i++) {
+        sum += ntohs(words[i]);
+    }
+
+    /* Handle odd byte if present */
+    if (len % 2) {
+        sum += ((uint8_t *)buf)[len - 1] << 8;
+    }
+
+    /* Fold 32-bit sum into 16 bits */
+    while (sum >> 16) {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+
+    return htons(~sum);
+}
+
 ad_transport_error_t
 ad_transport_handle_tun_event(void)
 {
@@ -1215,6 +1239,30 @@ ad_transport_handle_tun_event(void)
                          inet_ntoa(dst.sin_addr));
         g_stats.dropped_packets++;
         return AD_TRANSPORT_ERR_NOT_FOUND;
+    }
+
+    /* Set source address to TUN interface IP */
+    const char *tun_ipv4 = ad_tun_get_ipv4();
+    if (tun_ipv4) {
+        struct sockaddr_in src_addr_struct;
+        uint8_t prefix;
+        
+        /* Parse CIDR notation to extract IP address */
+        if (parse_cidr(tun_ipv4, &src_addr_struct, &prefix) == 0) {
+            ip->saddr = src_addr_struct.sin_addr.s_addr;
+            
+            /* Recalculate IP checksum (set checksum field to 0 first) */
+            ip->check = 0;
+            ip->check = compute_ip_checksum((const uint8_t *)ip, ip->ihl * 4);
+            
+            char ip_str[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &src_addr_struct.sin_addr, ip_str, sizeof(ip_str));
+            AD_LOG_TRANSPORT_DEBUG("Set source address to %s", ip_str);
+        } else {
+            AD_LOG_TRANSPORT_WARN("Failed to parse TUN interface IP: %s", tun_ipv4);
+        }
+    } else {
+        AD_LOG_TRANSPORT_WARN("Failed to get TUN interface IP address");
     }
 
     return ad_transport_write_udp_message(
