@@ -4,8 +4,7 @@
 int main(int argc, char **argv) {
     ::testing::InitGoogleTest(&argc, argv);
     ad_logger_init("../../../../configs/ad_zlog_config.conf");
-    //int ret = RUN_ALL_TESTS();
+    int ret = RUN_ALL_TESTS();
     ad_logger_fini();
-    //return ret;
-    return 0;
+    return ret;
 }
